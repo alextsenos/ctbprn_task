@@ -146,6 +146,7 @@ for ep in range(1, 2001):
     L = loss.item(); ema = L if ema is None else 0.98*ema + 0.02*L
     if ep % 100 == 0:
         ce, acc = eval_many(200)
-        print(f"[ep {ep:4d}] CE={L:.3f} EMA={ema:.3f}  eval_CE={ce:.3f} acc={acc:.3f}")
+        mix = torch.sigmoid(attn.beta).mean().item()
+        print(f"[ep {ep:4d}] CE={L:.3f} EMA={ema:.3f}  eval_CE={ce:.3f} acc={acc:.3f} mix={mix:.3f}")
 
 print(f"Uniform ln(V) = {math.log(V):.3f}")
