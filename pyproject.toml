@@ -1,0 +1,16 @@
+[project]
+name = "fused_attn_v2"
+version = "0.1.0"
+description = "Fused Attention V2 module"
+authors = [
+    { name = "Greg" }
+]
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = [
+    "torch>=2.0"
+]
+
+[build-system]
+requires = ["setuptools>=61", "wheel"]
+build-backend = "setuptools.build_meta"

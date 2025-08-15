@@ -1,0 +1,8 @@
+Metadata-Version: 2.4
+Name: fused_attn_v2
+Version: 0.1.0
+Summary: Fused Attention V2 module
+Author: Greg
+Requires-Python: >=3.9
+Description-Content-Type: text/markdown
+Requires-Dist: torch>=2.0
