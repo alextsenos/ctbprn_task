@@ -22,12 +22,12 @@ tau_target = 0.3
 attn.tau_skip = tau_start
 with torch.no_grad():
     attn.beta.data.fill_(beta_start)  # strongly local mix
-    attn.E_q.data.copy_(attn.E_k.data)     # stable latent
     for h in range(attn.H):
         Ev = attn.E_v[h].to(torch.float32)
         attn.D_v.data[h].copy_(torch.linalg.pinv(Ev).to(attn.E_v.dtype))
-# Keep E_v & D_v frozen; allow E_q/E_k to adapt latent similarity
-for p in [attn.E_v, attn.D_v]:
+# Freeze E_v & D_v during warm-up; unfreeze later for fine-tuning
+evdv_params = [attn.E_v, attn.D_v]
+for p in evdv_params:
     p.requires_grad_(False)
 
 # Identity W_o (since H*d_v == d_model == 512)
@@ -47,6 +47,8 @@ for n,p in attn.named_parameters():
 train_params += list(head.parameters())
 
 opt = torch.optim.AdamW(train_params, lr=3e-4, weight_decay=0.01)
+opt.add_param_group({'params': evdv_params, 'lr': 1e-4, 'weight_decay': 0.01})
+train_params += evdv_params
 # eta_min should be lower than base lr
 sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=1000, eta_min=3e-5)
 softplus = F.softplus
@@ -126,7 +128,12 @@ def run_episode():
     return ce_smooth(logits, tgt, smoothing=0.1)
 
 ema = None
+evdv_unfrozen = False
 for ep in range(1, 2001):
+    if not evdv_unfrozen and ep > warmup_steps:
+        for p in evdv_params:
+            p.requires_grad_(True)
+        evdv_unfrozen = True
     # Schedule beta and tau_skip
     if ep <= warmup_steps:
         frac = 0.0
