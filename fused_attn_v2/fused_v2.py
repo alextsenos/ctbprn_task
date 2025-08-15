@@ -135,6 +135,9 @@ class FusedAttentionState:
             self.M = self.M.to(device)
             self.z = self.z.to(device)
             self.S_prev = self.S_prev.to(device)
+            if self.block_means is not None:
+                # ensure all stored centroids live on the same device
+                self.block_means = [bm.to(device) for bm in self.block_means]
 
     def ensure_dtype(self, dtype: torch.dtype):  # [PROVED]
         """Convert buffers to `dtype` if needed so einsums don't dtype‑clash."""
@@ -148,6 +151,9 @@ class FusedAttentionState:
             self.M = self.M.to(dtype)
             self.z = self.z.to(dtype)
             self.S_prev = self.S_prev.to(dtype)
+            if self.block_means is not None:
+                # convert stored centroids so future routing einsums don't dtype-clash
+                self.block_means = [bm.to(dtype) for bm in self.block_means]
 
     # ---------- ring ops ----------
     def append_kv(self, K_tL: torch.Tensor, V_tL: torch.Tensor):  # [PROVED]
