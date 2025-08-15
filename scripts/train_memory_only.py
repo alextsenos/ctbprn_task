@@ -4,7 +4,9 @@ from fused_attn_v2 import FusedV2Config, build_fused_v2
 
 assert torch.cuda.is_available(), "CUDA required."
 
-V, ASK, FILL, GAP = 512, 0, 1, 128
+# Start with easier task (V=128, GAP=32), scale up later
+V, ASK, FILL, GAP = 128, 0, 1, 32
+V_TARGET, GAP_TARGET = 512, 128  # Target difficulty
 cfg = FusedV2Config(d_model=512, n_heads=8, head_dim=64, d_value=64,
                     r_latent=32, window=64, block_size=8, top_k_blocks=2,
                     tau_skip=-1.0, bsz=1)
@@ -12,9 +14,9 @@ attn, st, dev, dty = build_fused_v2(cfg)
 torch.manual_seed(0)
 
 # Warm-up hyper-params
-warmup_steps = 500   # purely local path
-beta_start = -1.5    # σ≈0.2 (~88% local)
-beta_target = -0.85  # σ≈0.3 mid-mix
+warmup_steps = 2000   # purely local path (extended for stability)
+beta_start = -3.0     # σ≈0.05 (~95% local)
+beta_target = -0.85   # σ≈0.3 mid-mix
 
 tau_start = 1.0
 tau_target = 0.3
@@ -22,6 +24,9 @@ tau_target = 0.3
 attn.tau_skip = tau_start
 with torch.no_grad():
     attn.beta.data.fill_(beta_start)  # strongly local mix
+    # Stable latent init: E_q matches E_k initially
+    attn.E_q.data.copy_(attn.E_k.data)
+    # Initialize D_v as pseudo-inverse of E_v
     for h in range(attn.H):
         Ev = attn.E_v[h].to(torch.float32)
         attn.D_v.data[h].copy_(torch.linalg.pinv(Ev).to(attn.E_v.dtype))
@@ -105,55 +110,91 @@ def eval_many(n_episodes=200):
 
 def run_episode():
     H, r = attn.H, attn.r
-    M = torch.zeros(1, H, r, r, device=dev, dtype=dty); z = torch.zeros(1, H, r, device=dev, dtype=dty)
+    eps = 1e-3  # Match eval stability
+    M = torch.zeros(1, H, r, r, device=dev, dtype=dty)
+    z = torch.full((1, H, r), eps, device=dev, dtype=dty)  # Prefill z
     key = torch.randint(2, V, (1,), device=dev).item()
     seq = [key] + [FILL]*GAP + [ASK]
+    # Process sequence
     for tok in seq[:-1]:
         QL, KL, VL = proj_qkv(emb(torch.tensor([tok], device=dev)))
         sK = softplus(KL)
+        # Delta-corrected update (stable with z prefilled)
         num_hat = torch.einsum('bhr,bhrr->bhr', sK, M)
         den_hat = (sK * z).sum(-1, keepdim=True).clamp_min(1e-6)
         VhatL = num_hat / den_hat
         w = sK.unsqueeze(-1) * (VL - VhatL).unsqueeze(-2)
         M = M + w
         z = z + sK
+    # Query
     QLq, _, _ = proj_qkv(emb(torch.tensor([ASK], device=dev)))
     sQ = softplus(QLq)
     num = torch.einsum('bhr,bhrr->bhr', sQ, M)
     den = (sQ * z).sum(-1, keepdim=True).clamp_min(1e-6)
-    YL  = num / den
-    Y   = torch.einsum('bhr,hrd->bhd', YL, attn.D_v)
+    YL = num / den
+    Y = torch.einsum('bhr,hrd->bhd', YL, attn.D_v)
     logits = head(Y.reshape(1, -1))
     tgt = torch.tensor([key], device=dev)
     return ce_smooth(logits, tgt, smoothing=0.1)
 
+def run_batch(batch_size=64):
+    """Run batch_size episodes and return mean loss."""
+    losses = []
+    for _ in range(batch_size):
+        losses.append(run_episode())
+    return sum(losses) / len(losses)
+
 ema = None
 evdv_unfrozen = False
-for ep in range(1, 2001):
+batch_size = 64  # Mini-batch episodes per step
+
+for ep in range(1, 10001):  # More steps for curriculum
+    # ---- Curriculum: scale up difficulty if ready ----
+    if ep % 500 == 0 and V < V_TARGET:
+        ce, _ = eval_many(100)
+        if ce < math.log(V) - 1.0:  # If doing well, make harder
+            V = min(V * 2, V_TARGET)
+            GAP = min(GAP * 2, GAP_TARGET)
+            print(f"[curriculum] V={V}, GAP={GAP}")
+    
+    # ---- Parameter schedules ----
     if not evdv_unfrozen and ep > warmup_steps:
         for p in evdv_params:
             p.requires_grad_(True)
         evdv_unfrozen = True
-    # Schedule beta and tau_skip
+    
+    # Beta and tau_skip schedules
     if ep <= warmup_steps:
         frac = 0.0
     else:
-        frac = (ep - warmup_steps) / max(1, 2000 - warmup_steps)
-    # cosine easing
-    cosf = 0.5 * (1 - math.cos(math.pi * frac))
+        frac = min(1.0, (ep - warmup_steps) / 2000)  # 2000 steps to reach target
+    
+    cosf = 0.5 * (1 - math.cos(math.pi * frac))  # cosine easing
+    
     with torch.no_grad():
+        # Beta: start very local, relax over time
         attn.beta.data.fill_(beta_start + cosf * (beta_target - beta_start))
+        # Tau_skip: start high (skip local), decrease (allow local)
         attn.tau_skip = tau_start + cosf * (tau_target - tau_start)
-        # k_top schedule: start strict local neighborhood (1) then increase to cfg value
+        # k_top: start with 1 block (local), increase to cfg.top_k_blocks
         attn.k_top = 1 if ep <= warmup_steps else cfg.top_k_blocks
-    loss = run_episode()
-    opt.zero_grad(set_to_none=True); loss.backward()
+    
+    # ---- Training step with mini-batch episodes ----
+    loss = run_batch(batch_size)
+    opt.zero_grad(set_to_none=True)
+    loss.backward()
     torch.nn.utils.clip_grad_norm_(train_params, 0.5)
-    opt.step(); sched.step()
-    L = loss.item(); ema = L if ema is None else 0.98*ema + 0.02*L
+    opt.step()
+    sched.step()
+    
+    # Track loss EMA
+    L = loss.item()
+    ema = L if ema is None else 0.98 * ema + 0.02 * L
+    
+    # Logging
     if ep % 100 == 0:
-        ce, acc = eval_many(200)
+        ce, acc = eval_many(200)  # Full eval
         mix = torch.sigmoid(attn.beta).mean().item()
-        print(f"[ep {ep:4d}] CE={L:.3f} EMA={ema:.3f}  eval_CE={ce:.3f} acc={acc:.3f} mix={mix:.3f}")
+        print(f"[ep {ep:4d}] CE={L:.3f} EMA={ema:.3f}  eval_CE={ce:.3f} acc={acc:.3f} mix={mix:.3f} V={V} GAP={GAP}")
 
 print(f"Uniform ln(V) = {math.log(V):.3f}")
