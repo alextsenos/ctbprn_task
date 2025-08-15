@@ -12,8 +12,8 @@ attn, st, dev, dty = build_fused_v2(cfg)
 torch.manual_seed(0)
 
 # Warm-up hyper-params
-warmup_steps = 2000  # purely local path
-beta_start = -4.0    # σ≈0.018 (~98% local)
+warmup_steps = 500   # purely local path
+beta_start = -1.5    # σ≈0.2 (~88% local)
 beta_target = -0.85  # σ≈0.3 mid-mix
 
 tau_start = 1.0
