@@ -413,6 +413,9 @@ class FusedAttentionV2(nn.Module):
         p_skip = self.router(QL)  # [Bsz, H]
         use_local = (p_skip <= self.tau_skip).unsqueeze(-1)  # [Bsz,H,1] boolean mask
 
+        # Log fraction of heads using the local path for monitoring.
+        print(f"use_local mean: {use_local.float().mean().item():.4f}")
+
         # Routing mask over the window positions: [Bsz,1,w]
         routed_mask = state.routed_mask(QL, self.k_top)  # [Bsz,1,w]
         # Exclude the slot just written (self) to avoid trivial copy-attention
