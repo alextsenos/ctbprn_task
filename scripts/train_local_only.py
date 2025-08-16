@@ -6,8 +6,8 @@ assert torch.cuda.is_available(), "CUDA required."
 # --- config: tiny vocab + local-only path
 V = 256  # tiny vocab so ln(V) ~ 5.545
 cfg = FusedV2Config(
-    d_model=512, n_heads=8, head_dim=64, d_value=64,
-    r_latent=32, window=64, block_size=8, top_k_blocks=2,
+    d_model=128, n_heads=4, head_dim=32, d_value=32,
+    r_latent=16, window=64, block_size=8, top_k_blocks=2,
     tau_skip=1.0,   # always use local path
     bsz=1,
 )

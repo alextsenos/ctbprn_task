@@ -52,8 +52,8 @@ def enable_gpu_fast_math():
         torch.set_float32_matmul_precision("high")
 
 # Smaller model configuration
-DEFAULT_DIM = 128  # Reduced from 256
-DEFAULT_BATCH = 32  # Reduced from 128
+DEFAULT_DIM = 64  # Reduced from 256
+DEFAULT_BATCH = 16  # Reduced from 128
 DEFAULT_STEPS = 20  # Reduced from 120
 
 # Model Components

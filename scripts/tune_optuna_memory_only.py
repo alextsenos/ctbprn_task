@@ -63,13 +63,13 @@ def eval_many(attn, head, emb, dev, dty, V=512, GAP=128, n_episodes=200):
         acc += int(logits.argmax(-1).item() == key)
     return tot_ce / n_episodes, acc / n_episodes
 
-def objective(trial, episodes=1000, eval_every=100):
-    # ---- Search space (no arch changes)
-    V = trial.suggest_categorical("V", [256, 512])             # task difficulty (ln(V) ~ 5.55 or 6.24)
+def objective(trial, episodes=400, eval_every=50):
+    # ---- Search space (no arch changes) - MORE CONSTRAINED
+    V = trial.suggest_categorical("V", [256])             # task difficulty (ln(V) ~ 5.55)
     base_lr = trial.suggest_float("lr_main", 1e-5, 5e-4, log=True)
     lr_evdv = trial.suggest_float("lr_evdv", 1e-5, 3e-4, log=True)
     wd      = trial.suggest_float("weight_decay", 1e-6, 1e-2, log=True)
-    warmup  = trial.suggest_int("warmup_steps", 100, 400)
+    warmup  = trial.suggest_int("warmup_steps", 50, 150)
     clip    = trial.suggest_float("clip_norm", 0.3, 1.0)
     smooth  = trial.suggest_float("label_smoothing", 0.0, 0.2)
 
@@ -80,12 +80,12 @@ def objective(trial, episodes=1000, eval_every=100):
     k_top_late  = trial.suggest_int("k_top_final", 1, 3)
 
     eta_min_ratio = trial.suggest_float("eta_min_ratio", 0.05, 0.5)
-    T_max_sched   = trial.suggest_int("T_max", 400, 1000)
+    T_max_sched   = trial.suggest_int("T_max", 200, 400)
 
-    # ---- Build attention/state (smaller config for faster tuning)
+    # ---- Build attention/state (smaller config for faster tuning) - SMALLER MODEL
     # Ensure d_model is divisible by n_heads and d_value is consistent
-    cfg = FusedV2Config(d_model=256, n_heads=4, head_dim=64, d_value=64,
-                        r_latent=16, window=32, block_size=8, top_k_blocks=2, bsz=1)
+    cfg = FusedV2Config(d_model=128, n_heads=2, head_dim=32, d_value=32,
+                        r_latent=8, window=32, block_size=8, top_k_blocks=2, bsz=1)
     attn, st, dev, dty = build_fused_v2(cfg)
 
     # Initialize mixer/router + pseudo-inverse D_v like your script
