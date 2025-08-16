@@ -79,26 +79,22 @@ class SwiGLU(nn.Module):
 # -------------------- attention helpers --------------------
 
 def sliding_window_mask(L: int, window: int, device: torch.device) -> torch.Tensor:
-    """(L, L) additive mask with -inf outside a ±window."""
+    """(L, L) boolean mask where True = masked/blocked"""
     i = torch.arange(L, device=device)
     j = i[None, :] - i[:, None]
-    m = (j.abs() > window)
-    mask = torch.zeros(L, L, device=device)
-    mask[m] = float("-inf")
-    return mask
+    return j.abs() > window  # (L, L) bool; True = masked
 
 
 def dilated_mask(L: int, window: int, dilation: int, device: torch.device) -> torch.Tensor:
     """
-    (L, L) additive mask for a 'dilated' band: keep positions within ±window
+    (L, L) boolean mask for a 'dilated' band: keep positions within ±window
     but only every `dilation`th index from the center line.
+    Returns: (L, L) bool where True = masked/blocked
     """
     i = torch.arange(L, device=device)
     j = i[None, :] - i[:, None]
     keep = (j.abs() <= window) & ((j % dilation) == 0)
-    mask = torch.zeros(L, L, device=device)
-    mask[~keep] = float("-inf")
-    return mask
+    return ~keep  # True = masked
 
 
 def key_padding_from_attention_mask(attn_mask_01: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
@@ -321,14 +317,47 @@ class FusedStack(nn.Module):
         key_padding_mask: Optional[torch.Tensor],
         mem_carry: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
+        x = x.contiguous()  # Ensure input is contiguous
+        
+        def _run_blk(blk, _x, _mask, _m):
+            # Pass all inputs explicitly, no outer scope captures
+            out_x, lat_last, new_m = blk(_x, key_padding_mask=_mask, mem_carry=_m)
+            return out_x, lat_last, new_m
+
         lat_last = None
         for blk in self.layers:
             if self.grad_ckpt and x.requires_grad:
-                x, lat_last, mem_carry = torch.utils.checkpoint.checkpoint(
-                    lambda _x, _m: blk(_x, key_padding_mask, _m), x, mem_carry, use_reentrant=False
+                # Create empty tensors for None inputs to maintain consistent signature
+                mask_tensor = key_padding_mask if key_padding_mask is not None else torch.tensor(
+                    [], device=x.device, dtype=torch.bool
                 )
+                mem_tensor = mem_carry if mem_carry is not None else torch.tensor(
+                    [], device=x.device, dtype=x.dtype
+                )
+                
+                # Debug prints (can be removed after verification)
+                # print("x", tuple(x.shape), x.dtype, x.device)
+                # if key_padding_mask is not None:
+                #     print("kpm", tuple(key_padding_mask.shape), key_padding_mask.dtype)
+                # if mem_carry is not None and torch.is_tensor(mem_carry):
+                #     print("mem", tuple(mem_carry.shape), mem_carry.dtype)
+                
+                x, lat_last, mem_carry = torch.utils.checkpoint.checkpoint(
+                    _run_blk,
+                    blk,  # Pass block as first argument
+                    x,    # Input tensor
+                    mask_tensor,  # Mask tensor (or empty)
+                    mem_tensor,   # Memory tensor (or empty)
+                    use_reentrant=False,
+                    preserve_rng_state=True,
+                )
+                
+                # Restore None for empty tensors
+                if mem_carry.numel() == 0:
+                    mem_carry = None
             else:
                 x, lat_last, mem_carry = blk(x, key_padding_mask, mem_carry)
+                
         return x, mem_carry
 
 
@@ -510,15 +539,44 @@ def deep_supervision_step(
     use_act: bool,
     Mmax: int,
     epsilon: float,
+    *,
+    step: int = 0,
+    act_warmup_steps: int = 200,
+    min_segments: int = 2,
+    q_weight: float = 0.25,
+    halt_margin: float = 0.1,
 ) -> Dict[str, Any]:
     """
-    One training iteration across one or more supervision segments.
-    - Detaches state between segments, giving frequent H feedback (stabilizes).
-    - Optional ACT/Q-learning head approximated with BCE targets (simple & stable).
+    One training iteration across one or more supervision segments with ACT warmup.
+    
+    Args:
+        model: The HRM model
+        input_ids: Input token IDs [B, L]
+        targets: Target labels [B] or [B, L] if per_token_head
+        attention_mask: Attention mask [B, L]
+        state: Current (zH, zL) state tuple
+        optimizer: Optimizer for the model
+        use_act: Whether to use ACT
+        Mmax: Maximum number of segments
+        epsilon: Epsilon for minimum segments sampling
+        step: Current training step (for warmup)
+        act_warmup_steps: Steps before enabling ACT
+        min_segments: Minimum segments to run
+        q_weight: Weight for Q-loss
+        halt_margin: Margin required for halting
     """
     cfg = model.cfg
     device = input_ids.device
-    Mmin = _epsilon_min_segments(epsilon, Mmax) if use_act else 1
+
+    # ACT warmup: disable ACT entirely for first act_warmup_steps
+    act_enabled = use_act and (step >= act_warmup_steps)
+
+    # epsilon sampling for Mmin when ACT is enabled, else fixed
+    def _sample_Mmin():
+        if not act_enabled:
+            return max(1, min_segments)
+        base = _epsilon_min_segments(epsilon, Mmax)
+        return max(base, min_segments)
 
     m = 0
     halted = False
@@ -527,43 +585,56 @@ def deep_supervision_step(
     last_logits = None
     last_q = None
 
+    Mmin = _sample_Mmin()
     while True:
         m += 1
         state, logits, q_values = model.forward_segment(state, input_ids, attention_mask)
-        seq_loss = sequence_loss(logits, targets, cfg.per_token_head)
 
-        if use_act and model.q_head is not None:
+        # ---- sequence loss (FP32 for stability)
+        if not cfg.per_token_head:
+            # logits: (B, V) ; targets: (B,)
+            assert logits.dim() == 2 and logits.size(0) == input_ids.size(0), f"logits {tuple(logits.shape)}"
+            seq_loss = F.cross_entropy(logits.float(), targets.long())
+        else:
+            # logits: (B, L, V) ; targets: (B, L)
+            B, L, V = logits.shape
+            assert targets.shape == (B, L), f"targets {tuple(targets.shape)} != {(B, L)}"
+            seq_loss = F.cross_entropy(logits.reshape(B * L, V).float(),
+                                     targets.reshape(B * L).long())
+
+        # ---- Q-loss with logits (only if ACT enabled)
+        q_loss = torch.tensor(0.0, device=device)
+        do_halt = (m >= Mmax)
+        if act_enabled and (q_values is not None):
             halt_logit, cont_logit = q_values[:, 0], q_values[:, 1]
-            want_halt = (m >= Mmin) & (halt_logit > cont_logit)
-            must_halt = (m >= Mmax)
-            do_halt = want_halt | must_halt
 
             with torch.no_grad():
                 if not cfg.per_token_head:
-                    pred = logits.argmax(dim=-1)
-                    reward = (pred == targets).float()
+                    reward = (logits.argmax(dim=-1) == targets).float()  # (B,)
                 else:
-                    pred = logits.argmax(dim=-1)
-                    reward = (pred.eq(targets).all(dim=1)).float()
+                    pred_tok = logits.argmax(dim=-1)
+                    reward = (pred_tok.eq(targets).all(dim=1)).float()
                 target_halt = reward
                 target_continue = torch.zeros_like(reward)
 
-            q = torch.sigmoid(q_values)
             q_loss = 0.5 * (
-                F.binary_cross_entropy(q[:, 0], target_halt) +
-                F.binary_cross_entropy(q[:, 1], target_continue)
-            )
-        else:
-            do_halt = (m >= Mmax)
-            q_loss = torch.tensor(0.0, device=device)
+                F.binary_cross_entropy_with_logits(halt_logit, target_halt) +
+                F.binary_cross_entropy_with_logits(cont_logit, target_continue)
+            ) * q_weight
 
-        loss = seq_loss + q_loss
+            # require a margin for halting, and obey Mmin / Mmax
+            want_halt = (m >= Mmin) & (halt_logit > (cont_logit + halt_margin))
+            must_halt = torch.full_like(want_halt, m >= Mmax, dtype=torch.bool)
+            do_halt = (want_halt | must_halt).all().item()
+
+        # ---- optimize
+        loss = (seq_loss + q_loss).float()
         optimizer.zero_grad(set_to_none=True)
         loss.backward()
         optimizer.step()
 
-        total_seq += float(seq_loss.detach())
-        total_q   += float(q_loss.detach())
+        total_seq += seq_loss.detach().float().item()
+        total_q   += q_loss.detach().float().item()
         last_logits = logits.detach()
         last_q = q_values.detach() if q_values is not None else None
 
@@ -577,7 +648,7 @@ def deep_supervision_step(
     return {
         "halted": halted,
         "segments": m,
-        "seq_loss": total_seq / m,
+        "seq_loss": total_seq / max(1, m),
         "q_loss": total_q / max(1, m),
         "last_logits": last_logits,
         "last_q": last_q,
