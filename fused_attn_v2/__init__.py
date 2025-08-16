@@ -7,7 +7,7 @@ known.
 
 # Prefer relative imports when `fused_attn_v2` is imported as a package.
 try:
-    from .fused_v2 import FusedAttentionV2  # type: ignore
+    from .fused_v2 import FusedV2HRMModel  # type: ignore
     from .build_fused_v2 import FusedV2Config, build_fused_v2, pick_cuda_dtype  # type: ignore
 except ImportError:  # pragma: no cover – executed directly / no parent pkg
     # Fallback: treat current directory as top-level on sys.path so absolute
@@ -16,6 +16,6 @@ except ImportError:  # pragma: no cover – executed directly / no parent pkg
     _p = _os.path.dirname(__file__)
     if _p not in _sys.path:
         _sys.path.insert(0, _p)
-    from fused_v2 import FusedAttentionV2  # type: ignore
+    from fused_v2 import FusedV2HRMModel  # type: ignore
     from build_fused_v2 import FusedV2Config, build_fused_v2, pick_cuda_dtype  # type: ignore
-__all__ = ["FusedAttentionV2", "FusedV2Config", "build_fused_v2", "pick_cuda_dtype"]
+__all__ = ["FusedV2HRMModel", "FusedV2Config", "build_fused_v2", "pick_cuda_dtype"]

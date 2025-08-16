@@ -1,541 +1,653 @@
-"""
-Fused Attention V2 (MoBA‑MLA + Infini‑Latent + Titans Gates) — up to attention output (pre‑MLP)
+# fused_v2.py
+# -----------------------------------------------------------------------------
+# FusedV2 + HRM for long-context reasoning on mid-range GPUs (e.g., RTX 5060 Ti 16GB).
+# Branches:
+#   - Local block attention (sliding window)
+#   - Dilated block attention
+#   - Latent attention (tokens <-> latent slots)
+#   - Infini-style memory (compress + retrieve from memory tokens)
+#
+# Mixer:
+#   - "TitanFusion": a soft / (optionally top-k) gated mixture over branches
+#
+# HRM core:
+#   - Two recurrent modules: L (fast) and H (slow), each an encoder-only stack built
+#     from the fused layer above.
+#   - One-step gradient approximation (all but the last internal step run under no_grad).
+#   - Deep supervision across segments with hidden-state detach between segments.
+#   - Optional ACT/Q-head to learn a halting policy.
+#
+# Notes:
+# - This is a practical, faithful integration of HRM (one-step grad, deep supervision, ACT).
+#   See the paper’s pseudocode and training details.  [citations in your PR/README]
+# - The attention masks are implemented with torch additive masks; for production
+#   switch to FlashAttention v3 or a custom Triton kernel for speed.
+# - Defaults are chosen to fit ~16GB VRAM with bf16/fp16 at typical seq lengths;
+#   tune d_model, heads, windows, and layers for your exact workload.
+# -----------------------------------------------------------------------------
 
-This is a reference‑quality, **dtype‑safe** implementation of the canonical V2 spec for
-incremental decoding. It fixes previous dtype mismatches and ring‑buffer masking issues,
-and provides precise masking for the filled window in the ring (no approximations).
 
-Status labels in comments:
-- [PROVED]: matches spec or standard transformer practice.
-- [INFERENCE]: design/heuristic choices that are reasonable but not formally validated here.
-- [UNVERIFIED]: optional hooks or comments about potential behavior without direct proof.
-
-Notes
------
-* Focuses on incremental decoding (token‑by‑token). Prefill can be added later.  [PROVED]
-* All persistent state is held in `FusedAttentionState`.                       [PROVED]
-* Dtype/device coherence: the state auto‑adapts to the module's compute dtype
-  and device on first use via `ensure_dtype`/`ensure_device`.                  [PROVED]
-
-Author: AI PROJECT — Fused Attention V2 reference.
-"""
 from __future__ import annotations
+
+import math
 from dataclasses import dataclass
-from typing import Optional, Tuple, List
+from typing import Optional, Tuple, Dict, Any, List
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
 
-# ---------------------------
-# Utility helpers
-# ---------------------------
+# -------------------- utilities --------------------
 
-def safe_softplus(x: torch.Tensor, beta: float = 1.0) -> torch.Tensor:
-    """Numerically safe positive map σ(x)=softplus(x). [PROVED]
-    Using default beta=1 to keep magnitudes reasonable.
-    """
-    return F.softplus(x, beta=beta)
+def autocast_dtype():
+    """Pick the best mixed-precision dtype available on the current GPU."""
+    if torch.cuda.is_available() and torch.cuda.is_bf16_supported():
+        return torch.bfloat16
+    return torch.float16
 
 
-def masked_softmax(logits: torch.Tensor, mask: torch.Tensor, dim: int = -1) -> torch.Tensor:
-    """Softmax over entries where mask==True; masked positions receive a large negative.
-    mask is boolean and broadcastable to logits. [PROVED]
-    """
-    # Use the minimum finite value for the dtype to avoid NaNs in half precision.
-    neg_large = torch.finfo(logits.dtype).min
-    logits = torch.where(mask, logits, torch.full_like(logits, neg_large))
-    return F.softmax(logits, dim=dim)
-
-
-# ---------------------------
-# State container
-# ---------------------------
-
-@dataclass
-class FusedAttentionState:
-    """Holds all persistent per‑layer state for incremental decoding. [PROVED]
-
-    Shapes are per batch and head where applicable.
-
-    Args
-    ----
-    w: latent KV window size.
-    B: block size (tokens per block).
-    H: number of heads.
-    r: latent dimension.
-    device, dtype: initialize buffers on this device/dtype.
-    """
-
-    w: int
-    B: int
-    H: int
-    r: int
-    device: torch.device
-    dtype: torch.dtype
-
-    # Latent KV ring buffers (physical ring of size w). Shapes: [Bsz, H, w, r]
-    K_latent: Optional[torch.Tensor] = None
-    V_latent: Optional[torch.Tensor] = None
-
-    # Block id per physical slot in the ring: [Bsz, w] (int64)
-    block_ids: Optional[torch.Tensor] = None
-
-    # Current write pointer in ring, and filled logical length (<= w)
-    write_ptr: int = 0
-    length: int = 0
-
-    # Current block running stats
-    cur_block_sum: Optional[torch.Tensor] = None  # [Bsz, H, r]
-    cur_block_count: int = 0
-    cur_block_id: int = 0
-
-    # Stored past block centroids (list of tensors [Bsz, H, r]) up to some cap
-    block_means: List[torch.Tensor] = None
-    block_mean_cap: int = 4096  # safety cap
-
-    # Infini memory per head per batch
-    M: Optional[torch.Tensor] = None  # [Bsz, H, r, r]
-    z: Optional[torch.Tensor] = None  # [Bsz, H, r]
-
-    # Titans running accumulator S_t
-    S_prev: Optional[torch.Tensor] = None  # [Bsz, H, r, r]
-
-    # Cached batch size (immutable for lifetime of this state)
-    bsz: int = 0
-
-    # ---------- init & maintenance ----------
-    def init_buffers(self, bsz: int):  # [PROVED]
-        self.bsz = bsz
-        self.K_latent = torch.zeros(bsz, self.H, self.w, self.r, device=self.device, dtype=self.dtype)
-        self.V_latent = torch.zeros_like(self.K_latent)
-        self.block_ids = torch.full((bsz, self.w), fill_value=-1, device=self.device, dtype=torch.long)
-        self.cur_block_sum = torch.zeros(bsz, self.H, self.r, device=self.device, dtype=self.dtype)
-        self.block_means = []
-        self.M = torch.zeros(bsz, self.H, self.r, self.r, device=self.device, dtype=self.dtype)
-        # Prefill z with small epsilon to stabilize early memory reads
-        self.z = torch.full((bsz, self.H, self.r), 1e-3, device=self.device, dtype=self.dtype)
-        self.S_prev = torch.zeros(bsz, self.H, self.r, self.r, device=self.device, dtype=self.dtype)
-        self.write_ptr = 0
-        self.length = 0
-        self.cur_block_count = 0
-        self.cur_block_id = 0
-
-    def ensure_device(self, device: torch.device):  # [PROVED]
-        """Move buffers to `device` if needed."""
-        if self.device == device:
-            return
-        self.device = device
-        if self.K_latent is not None:
-            self.K_latent = self.K_latent.to(device)
-            self.V_latent = self.V_latent.to(device)
-            self.block_ids = self.block_ids.to(device)
-            self.cur_block_sum = self.cur_block_sum.to(device)
-            self.M = self.M.to(device)
-            self.z = self.z.to(device)
-            self.S_prev = self.S_prev.to(device)
-
-    def ensure_dtype(self, dtype: torch.dtype):  # [PROVED]
-        """Convert buffers to `dtype` if needed so einsums don't dtype‑clash."""
-        if self.dtype == dtype:
-            return
-        self.dtype = dtype
-        if self.K_latent is not None:
-            self.K_latent = self.K_latent.to(dtype)
-            self.V_latent = self.V_latent.to(dtype)
-            self.cur_block_sum = self.cur_block_sum.to(dtype)
-            self.M = self.M.to(dtype)
-            self.z = self.z.to(dtype)
-            self.S_prev = self.S_prev.to(dtype)
-
-    # ---------- ring ops ----------
-    def append_kv(self, K_tL: torch.Tensor, V_tL: torch.Tensor):  # [PROVED]
-        """Append one latent KV token to the ring (runtime state, no grad)."""
-        with torch.no_grad():
-            # Hard break any graph links
-            K_tL = K_tL.detach()
-            V_tL = V_tL.detach()
-            assert K_tL.shape == (self.bsz, self.H, self.r)
-            idx = self.write_ptr
-            self.K_latent[:, :, idx, :] = K_tL
-            self.V_latent[:, :, idx, :] = V_tL
-            self.block_ids[:, idx] = self.cur_block_id
-
-        self.write_ptr = (self.write_ptr + 1) % self.w
-        self.length = min(self.length + 1, self.w)
-
-        # Update running stats for current block. [PROVED]
-        self.cur_block_sum.add_(K_tL)
-        self.cur_block_count += 1
-
-        # Handle block rollover. [PROVED]
-        if self.cur_block_count == self.B:
-            centroid = (self.cur_block_sum / float(self.B)).detach()
-            self.block_means.append(centroid)  # already detached
-            if len(self.block_means) > self.block_mean_cap:
-                self.block_means.pop(0)
-            self.cur_block_sum.zero_()
-            self.cur_block_count = 0
-            self.cur_block_id += 1
-
-    def valid_slots_mask(self) -> torch.Tensor:  # [PROVED]
-        """Boolean mask over physical ring slots that are logically filled. Shape [1, 1, w]."""
-        m = torch.zeros(self.w, dtype=torch.bool, device=self.device)
-        L = self.length
-        if L == self.w:
-            m[:] = True
-        elif L > 0:
-            start = (self.write_ptr - L) % self.w
-            if start + L <= self.w:
-                m[start : start + L] = True
-            else:
-                tail = (start + L) - self.w
-                m[start : self.w] = True
-                m[0 : tail] = True
-        # Expand to broadcast over batch and heads later
-        return m.view(1, 1, self.w)
-
-    def routed_mask(self, Q_tL: torch.Tensor, k_top: int) -> torch.Tensor:
-        """Compute boolean mask over window positions to select routed tokens. [NEW]
-        Returns a mask of shape [Bsz, 1, w] (broadcastable over heads).
-        Routing is based on block means: select current block + top‑k of past blocks by ⟨Q_t^L, K̄_i^L⟩/√r.
-        """
-        if self.length == 0:
-            return torch.zeros(self.bsz, 1, self.w, dtype=torch.bool, device=self.device)
-
-        routed_block_ids_per_batch: List[torch.Tensor] = []
-        if self.block_means:
-            # scores: per stored block, per batch and head
-            scores_list = []
-            for Kbar in self.block_means:  # each: [Bsz, H, r]
-                s = (Q_tL * Kbar).sum(-1) / (self.r ** 0.5)  # [Bsz, H]
-                scores_list.append(s)
-            scores = torch.stack(scores_list, dim=-1)  # [Bsz, H, num_blocks]
-            # Recency bias: favor recent blocks exponentially (gamma^age). Recent => weight 1.0
-            num_blocks = scores.shape[-1]
-            gamma = 0.97  # older blocks down‑weighted by gamma^age
-            # age 0 = most recent (last in list), age = num_blocks-1 = oldest (first)
-            ages = torch.arange(num_blocks - 1, -1, -1, device=self.device, dtype=scores.dtype)
-            weights = gamma ** ages  # [num_blocks]
-            scores = scores * weights  # broadcast on last dim
-            scores_mean = scores.mean(1)               # [Bsz, num_blocks]
-            k_eff = min(k_top, scores_mean.shape[-1])
-            topk_idx = scores_mean.topk(k_eff, dim=-1).indices  # [Bsz, k_eff]
-            # Stored block_means correspond to block ids [0..cur_block_id-1] in order. [PROVED]
-            for b in range(self.bsz):
-                routed_block_ids_per_batch.append(topk_idx[b].to(torch.long))
-        else:
-            for _ in range(self.bsz):
-                routed_block_ids_per_batch.append(torch.empty(0, dtype=torch.long, device=self.device))
-
-        mask = torch.zeros(self.bsz, self.w, dtype=torch.bool, device=self.device)
-        cur_id = self.cur_block_id
-        for b in range(self.bsz):
-            routed = set(routed_block_ids_per_batch[b].tolist())
-            routed.add(cur_id)  # always include current block
-            routed_tensor = torch.tensor(list(routed), device=self.device, dtype=torch.long)
-            pos_blocks = self.block_ids[b]  # [w]
-            allowed = torch.isin(pos_blocks, routed_tensor)
-            mask[b] = allowed
-
-        return mask.unsqueeze(1)  # [Bsz, 1, w]
-
-
-# ---------------------------
-# Router and Gater submodules
-# ---------------------------
-
-class TinyRouter(nn.Module):
-    """A tiny router that outputs p_skip in [0,1] from latent Q. [NEW]
-    2‑layer MLP with GELU and Sigmoid. Per‑head, pointwise.
-    """
-    def __init__(self, r: int):
+class RMSNorm(nn.Module):
+    def __init__(self, d: int, eps: float = 1e-6):
         super().__init__()
-        self.fc1 = nn.Linear(r, 2 * r)
-        self.fc2 = nn.Linear(2 * r, 1)
+        self.eps = eps
+        self.weight = nn.Parameter(torch.ones(d))
 
-    def forward(self, q_lat: torch.Tensor) -> torch.Tensor:
-        # q_lat: [Bsz, H, r]
-        x = F.gelu(self.fc1(q_lat))
-        p = torch.sigmoid(self.fc2(x))  # [Bsz, H, 1]
-        return p.squeeze(-1)  # [Bsz, H]
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # (..., d)
+        s = x.pow(2).mean(dim=-1, keepdim=True)
+        x = x * torch.rsqrt(s + self.eps)
+        return self.weight * x
 
 
-class TitansGater(nn.Module):
-    """Produces (α, η, θ) from surprise features u_t. [INFERENCE]
-    α∈[0,1] via sigmoid, η,θ≥0 via softplus. Reduces per‑head to scalars.
-    """
-    def __init__(self, r: int, hidden: int = 4):
+def swiglu(x: torch.Tensor) -> torch.Tensor:
+    a, b = x.chunk(2, dim=-1)
+    return F.silu(a) * b
+
+
+class SwiGLU(nn.Module):
+    def __init__(self, d_model: int, d_ff: int, dropout: float = 0.0):
         super().__init__()
-        self.fc1 = nn.Linear(4 * r, hidden * r)
-        self.fc2 = nn.Linear(hidden * r, 3 * r)
+        self.up = nn.Linear(d_model, 2 * d_ff, bias=False)
+        self.down = nn.Linear(d_ff, d_model, bias=False)
+        self.dropout = nn.Dropout(dropout)
 
-    def forward(self, u: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        # u: [Bsz, H, 4r]
-        h = F.gelu(self.fc1(u))
-        out = self.fc2(h)  # [Bsz, H, 3r]
-        a, e, t = out.chunk(3, dim=-1)
-        # Reduce across r to scalars per head via mean (lightweight). [INFERENCE]
-        alpha = torch.sigmoid(a.mean(-1, keepdim=True))  # [Bsz, H, 1]
-        eta = F.softplus(e.mean(-1, keepdim=True))
-        theta = F.softplus(t.mean(-1, keepdim=True))
-        return alpha, eta, theta
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.dropout(self.down(swiglu(self.up(x))))
 
 
-# ---------------------------
-# The Fused Attention V2 module
-# ---------------------------
+# -------------------- attention helpers --------------------
 
-class FusedAttentionV2(nn.Module):
+def sliding_window_mask(L: int, window: int, device: torch.device) -> torch.Tensor:
+    """(L, L) additive mask with -inf outside a ±window."""
+    i = torch.arange(L, device=device)
+    j = i[None, :] - i[:, None]
+    m = (j.abs() > window)
+    mask = torch.zeros(L, L, device=device)
+    mask[m] = float("-inf")
+    return mask
+
+
+def dilated_mask(L: int, window: int, dilation: int, device: torch.device) -> torch.Tensor:
+    """
+    (L, L) additive mask for a 'dilated' band: keep positions within ±window
+    but only every `dilation`th index from the center line.
+    """
+    i = torch.arange(L, device=device)
+    j = i[None, :] - i[:, None]
+    keep = (j.abs() <= window) & ((j % dilation) == 0)
+    mask = torch.zeros(L, L, device=device)
+    mask[~keep] = float("-inf")
+    return mask
+
+
+def key_padding_from_attention_mask(attn_mask_01: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
+    """
+    Convert HuggingFace-style 1=keep, 0=pad mask (B, L) -> MultiheadAttention key_padding_mask (B, L) with True for PAD.
+    """
+    if attn_mask_01 is None:
+        return None
+    return (attn_mask_01 == 0)
+
+
+class MHA(nn.Module):
+    """Wrapper around MultiheadAttention with batch_first=True and post-norm residual."""
+    def __init__(self, d_model: int, n_heads: int, dropout: float = 0.0):
+        super().__init__()
+        self.mha = nn.MultiheadAttention(d_model, n_heads, dropout=dropout, bias=False, batch_first=True)
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(
+        self,
+        x_q: torch.Tensor,
+        x_kv: torch.Tensor,
+        attn_mask: Optional[torch.Tensor] = None,         # (Lq, Lkv)
+        key_padding_mask: Optional[torch.Tensor] = None,  # (B, Lkv) True=PAD
+    ) -> torch.Tensor:
+        out, _ = self.mha(x_q, x_kv, x_kv, attn_mask=attn_mask, key_padding_mask=key_padding_mask, need_weights=False)
+        return self.dropout(out)
+
+
+# -------------------- latent attention (DeepSeek-style) --------------------
+
+class LatentPool(nn.Module):
+    """
+    Small set of K latent slots that first **read** tokens (latents <- tokens) and then
+    **write** back (tokens <- latents). Similar spirit to Perceiver latent bottlenecks.
+    """
+    def __init__(self, d_model: int, n_heads: int, K: int, dropout: float = 0.0):
+        super().__init__()
+        self.K = K
+        self.latents = nn.Parameter(torch.randn(1, K, d_model) / math.sqrt(d_model))
+        self.norm_q = RMSNorm(d_model)
+        self.norm_kv = RMSNorm(d_model)
+        self.to_latents = MHA(d_model, n_heads, dropout)
+        self.from_latents = MHA(d_model, n_heads, dropout)
+
+    def forward(self, x: torch.Tensor, key_padding_mask: Optional[torch.Tensor]) -> Tuple[torch.Tensor, torch.Tensor]:
+        B, L, D = x.shape
+        lat = self.latents.expand(B, self.K, D)
+
+        # latents read tokens
+        lat_q = self.norm_q(lat)
+        tok_kv = self.norm_kv(x)
+        lat = lat + self.to_latents(lat_q, tok_kv, attn_mask=None, key_padding_mask=key_padding_mask)
+
+        # tokens read latents
+        x = x + self.from_latents(self.norm_q(x), self.norm_kv(lat), attn_mask=None, key_padding_mask=None)
+        return x, lat
+
+
+# -------------------- infini-style memory --------------------
+
+class InfiniMemory(nn.Module):
+    """
+    Lightweight memory compressor:
+      - Builds M memory tokens via attention pooling from tokens.
+      - Updates memory with EMA (gamma) to carry signal across layers/segments.
+    """
+    def __init__(self, d_model: int, n_heads: int, M: int, dropout: float = 0.0, gamma: float = 0.9):
+        super().__init__()
+        self.M = M
+        self.gamma = gamma
+        self.mem_tokens = nn.Parameter(torch.randn(1, M, d_model) / math.sqrt(d_model))
+        self.read_mha = MHA(d_model, n_heads, dropout)
+        self.write_mha = MHA(d_model, n_heads, dropout)
+        self.norm_q = RMSNorm(d_model)
+        self.norm_kv = RMSNorm(d_model)
+
+    def forward(self, x: torch.Tensor, key_padding_mask: Optional[torch.Tensor], carry: Optional[torch.Tensor] = None
+                ) -> Tuple[torch.Tensor, torch.Tensor]:
+        B, L, D = x.shape
+        mem_prev = self.mem_tokens.expand(B, self.M, D) if carry is None else carry
+
+        # Write: mem reads tokens
+        mem_new = mem_prev + self.write_mha(self.norm_q(mem_prev), self.norm_kv(x), key_padding_mask=key_padding_mask)
+        mem = self.gamma * mem_prev + (1.0 - self.gamma) * mem_new
+
+        # Read: tokens read memory
+        x = x + self.read_mha(self.norm_q(x), self.norm_kv(mem), key_padding_mask=None)
+        return x, mem
+
+
+# -------------------- moBA branches + TitanFusion --------------------
+
+class LocalDilatedAttention(nn.Module):
+    def __init__(self, d_model: int, n_heads: int, dropout: float = 0.0, window: int = 256, dilation: int = 4):
+        super().__init__()
+        self.local = MHA(d_model, n_heads, dropout)
+        self.dilated = MHA(d_model, n_heads, dropout)
+        self.window = window
+        self.dilation = dilation
+        self.norm_q = RMSNorm(d_model)
+        self.norm_kv = RMSNorm(d_model)
+
+    def forward(self, x: torch.Tensor, key_padding_mask: Optional[torch.Tensor]) -> Tuple[torch.Tensor, torch.Tensor]:
+        B, L, D = x.shape
+        device = x.device
+
+        # build additive masks once per forward
+        local_mask = sliding_window_mask(L, self.window, device)
+        dil_mask = dilated_mask(L, self.window, self.dilation, device)
+
+        q = self.norm_q(x)
+        k = self.norm_kv(x)
+        out_local = self.local(q, k, attn_mask=local_mask, key_padding_mask=key_padding_mask)
+        out_dil = self.dilated(q, k, attn_mask=dil_mask, key_padding_mask=key_padding_mask)
+        return out_local, out_dil
+
+
+class TitanFusion(nn.Module):
+    """
+    Gated mixture over branches: local, dilated, latent, memory.
+    Optionally enforces top-k sparsity over branches (per token).
+    """
+    def __init__(self, d_model: int, n_branches: int, dropout: float = 0.0, topk: int = 0):
+        super().__init__()
+        self.gate = nn.Linear(d_model, n_branches, bias=True)
+        self.dropout = nn.Dropout(dropout)
+        self.topk = topk
+
+    def forward(self, x: torch.Tensor, branches: List[torch.Tensor]) -> torch.Tensor:
+        # branches: list of (B, L, D)
+        B, L, D = x.shape
+        H = torch.stack(branches, dim=-2)  # (B, L, n_br, D)
+        logits = self.gate(x)              # (B, L, n_br)
+        if self.topk and self.topk < logits.size(-1):
+            # keep top-k branches per token
+            topk_vals, topk_idx = torch.topk(logits, k=self.topk, dim=-1)
+            mask = torch.full_like(logits, float("-inf"))
+            mask.scatter_(-1, topk_idx, topk_vals)
+            logits = mask
+        w = torch.softmax(logits, dim=-1).unsqueeze(-1)  # (B, L, n_br, 1)
+        fused = (w * H).sum(dim=-2)  # (B, L, D)
+        return self.dropout(fused)
+
+
+# -------------------- fused layer (one block) --------------------
+
+class FusedLayer(nn.Module):
     def __init__(
         self,
         d_model: int,
         n_heads: int,
-        head_dim: int,
-        d_value: int,
-        r_latent: int,
+        d_ff: int,
+        dropout: float,
         window: int,
-        block_size: int,
-        top_k_blocks: int = 2,
-        tau_skip: float = 0.2,
-        rope: Optional[object] = None,  # placeholder hook for RoPE
+        dilation: int,
+        K_latent: int,
+        M_mem: int,
+        titan_topk: int = 0,
     ):
-        """Initialize the fused attention (pre‑MLP) stack. [PROVED]
-
-        Args:
-            d_model: model dimension.
-            n_heads: number of attention heads H.
-            head_dim: per‑head Q/K dimension d_h.
-            d_value: per‑head V/out dimension d_v.
-            r_latent: latent rank r.
-            window: latent KV window size w.
-            block_size: block size B for routing.
-            top_k_blocks: k for MoBA routing.
-            tau_skip: threshold for skipping local path (<= uses local). [INFERENCE]
-            rope: optional positional encoding hook. [UNVERIFIED]
-        """
         super().__init__()
-        self.d_model = d_model
-        self.H = n_heads
-        self.d_h = head_dim
-        self.d_v = d_value
-        self.r = r_latent
-        self.w = window
-        self.B = block_size
-        self.k_top = top_k_blocks
-        self.tau_skip = tau_skip
-        self.rope = rope
+        self.norm = RMSNorm(d_model)
 
-        # Input layer norm before attention (Pre‑LN block). [PROVED]
-        self.ln = nn.LayerNorm(d_model)
+        self.local_dil = LocalDilatedAttention(d_model, n_heads, dropout, window, dilation)
+        self.latent = LatentPool(d_model, n_heads, K_latent, dropout)
+        self.mem = InfiniMemory(d_model, n_heads, M_mem, dropout)
 
-        # Combined QKV projection to per‑head spaces. [PROVED]
-        self.W_qkv = nn.Linear(d_model, n_heads * (2 * head_dim + d_value), bias=False)
+        self.mixer = TitanFusion(d_model, n_branches=4, dropout=dropout, topk=titan_topk)
+        self.ffn = SwiGLU(d_model, d_ff, dropout)
+        self.dropout = nn.Dropout(dropout)
 
-        # Latent projections per head (E_q, E_k, E_v). [PROVED]
-        self.E_q = nn.Parameter(torch.randn(n_heads, head_dim, r_latent) / (head_dim ** 0.5))
-        self.E_k = nn.Parameter(torch.randn(n_heads, head_dim, r_latent) / (head_dim ** 0.5))
-        self.E_v = nn.Parameter(torch.randn(n_heads, d_value, r_latent) / (d_value ** 0.5))
-
-        # Decoder back to value dim per head (D_v). Init as pseudo-inverse of E_v for well-conditioned start.
-        D_init = torch.empty(n_heads, r_latent, d_value)
-        for h in range(n_heads):
-            Ev = self.E_v[h].detach().to(torch.float32)
-            D_init[h] = torch.linalg.pinv(Ev).to(Ev.dtype)
-        self.D_v = nn.Parameter(D_init)
-
-        # Output projection back to d_model. [PROVED]
-        self.W_o = nn.Linear(n_heads * d_value, d_model, bias=False)
-
-        # Router and Gater. [NEW]
-        self.router = TinyRouter(r_latent)
-        self.gater = TitansGater(r_latent)
-        # Optionally freeze gater parameters; they affect no-grad state only
-        for p in self.gater.parameters():
-            p.requires_grad_(False)
-
-        # Per‑head learnable mix β (scalar). Initialize near 0.2 so local path dominates early. [INFERENCE]
-        self.beta = nn.Parameter(torch.full((n_heads, 1), 0.2))
-
-    # --------- public API ---------
-    def init_state(self, bsz: int, device: Optional[torch.device] = None, dtype: Optional[torch.dtype] = None) -> FusedAttentionState:
-        # Use module's parameter device/dtype by default. [PROVED]
-        device = device or next(self.parameters()).device
-        dtype = dtype or next(self.parameters()).dtype
-        st = FusedAttentionState(self.w, self.B, self.H, self.r, device, dtype)
-        st.init_buffers(bsz)
-        return st
-
-    @torch.no_grad()
-    def reset_state_(self, state: FusedAttentionState):  # [PROVED]
-        state.init_buffers(state.bsz)
-
-    # --------- forward (incremental) ---------
-    def forward(self, x_t: torch.Tensor, state: FusedAttentionState) -> torch.Tensor:
-        """One‑step incremental forward.
-        x_t: [Bsz, d_model] token at time t. Returns [Bsz, d_model]. [PROVED]
+    def forward(
+        self,
+        x: torch.Tensor,
+        key_padding_mask: Optional[torch.Tensor],
+        mem_carry: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
-        Bsz = x_t.size(0)
-        if state.bsz not in (0, Bsz):
-            raise RuntimeError(f"State batch size {state.bsz} mismatches input batch {Bsz}")
-        if state.bsz == 0:
-            state.init_buffers(Bsz)
+        Returns:
+          x_out, latents, mem_new
+        """
+        h = self.norm(x)
 
-        # Harmonize state device/dtype with module's compute soon used for Q,K,V. [PROVED]
-        compute_device = x_t.device
-        compute_dtype = self.ln.weight.dtype  # LN weight dtype defines compute path
-        state.ensure_device(compute_device)
-        state.ensure_dtype(compute_dtype)
+        # moBA branches
+        out_local, out_dil = self.local_dil(h, key_padding_mask)
+        x_lat, latents = self.latent(h, key_padding_mask)
+        x_mem, mem_new = self.mem(h, key_padding_mask, carry=mem_carry)
 
-        # Pre‑LN
-        x = self.ln(x_t.to(compute_dtype))
+        fused = self.mixer(h, [out_local, out_dil, x_lat, x_mem])
+        x = x + self.dropout(fused)
+        x = x + self.dropout(self.ffn(self.norm(x)))
+        return x, latents, mem_new
 
-        # Project to per‑head Q, K, V. [PROVED]
-        qkv = self.W_qkv(x)  # [Bsz, H*(2*d_h + d_v)]
-        qkv = qkv.view(Bsz, self.H, 2 * self.d_h + self.d_v)
-        Q, K, V = torch.split(qkv, [self.d_h, self.d_h, self.d_v], dim=-1)  # [Bsz,H,d_h] etc.
 
-        # Optional RoPE (hook). [UNVERIFIED]
-        if self.rope is not None:
-            Q, K = self.rope(Q, K)
+class FusedStack(nn.Module):
+    def __init__(
+        self,
+        d_model: int,
+        n_layers: int,
+        n_heads: int,
+        d_ff: int,
+        dropout: float,
+        window: int,
+        dilation: int,
+        K_latent: int,
+        M_mem: int,
+        titan_topk: int,
+        grad_ckpt: bool = False,
+    ):
+        super().__init__()
+        self.layers = nn.ModuleList([
+            FusedLayer(d_model, n_heads, d_ff, dropout, window, dilation, K_latent, M_mem, titan_topk)
+            for _ in range(n_layers)
+        ])
+        self.grad_ckpt = grad_ckpt
 
-        # Latent projections: Q^L, K^L, V^L. [PROVED]
-        QL = torch.einsum('bhd,hdr->bhr', Q, self.E_q)
-        KL = torch.einsum('bhd,hdr->bhr', K, self.E_k)
-        VL = torch.einsum('bhd,hdr->bhr', V, self.E_v)
+    def forward(
+        self,
+        x: torch.Tensor,
+        key_padding_mask: Optional[torch.Tensor],
+        mem_carry: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        lat_last = None
+        for blk in self.layers:
+            if self.grad_ckpt and x.requires_grad:
+                x, lat_last, mem_carry = torch.utils.checkpoint.checkpoint(
+                    lambda _x, _m: blk(_x, key_padding_mask, _m), x, mem_carry, use_reentrant=False
+                )
+            else:
+                x, lat_last, mem_carry = blk(x, key_padding_mask, mem_carry)
+        return x, mem_carry
 
-        # Append to latent KV window and update block stats. [PROVED]
-        state.append_kv(KL.detach(), VL.detach())
 
-        # ---------------- Local latent attention over routed tokens ----------------
-        # Router: decide whether to use local path. [NEW]
-        p_skip = self.router(QL)  # [Bsz, H]
-        use_local = (p_skip <= self.tau_skip).unsqueeze(-1)  # [Bsz,H,1] boolean mask
+# -------------------- HRM Core --------------------
 
-        # Log fraction of heads using the local path for monitoring.
-        print(f"use_local mean: {use_local.float().mean().item():.4f}")
+@dataclass
+class HRMConfig:
+    # embedding
+    vocab_size: int = 32000
+    max_len: int = 8192
+    pad_token_id: int = 0
 
-        # Routing mask over the window positions: [Bsz,1,w]
-        routed_mask = state.routed_mask(QL, self.k_top)  # [Bsz,1,w]
-        # Exclude the slot just written (self) to avoid trivial copy-attention
-        last_idx = (state.write_ptr - 1) % self.w
-        no_self_mask = torch.ones(1, 1, self.w, dtype=torch.bool, device=state.device)
-        no_self_mask[..., last_idx] = False
-        routed_mask = routed_mask & no_self_mask
+    # model dims
+    d_model: int = 640
+    n_heads: int = 8
+    d_ff: int = 2048
 
-        # Valid logical slots in physical ring: [1,1,w] -> broadcast
-        valid_mask = state.valid_slots_mask().to(routed_mask.device)  # [1,1,w]
+    # L/H stacks
+    n_layers_L: int = 6
+    n_layers_H: int = 4
 
-        # Combine masks (and broadcast over heads below)
-        base_mask = routed_mask & valid_mask  # [Bsz,1,w]
+    # fused attention params
+    dropout: float = 0.0
+    window: int = 256
+    dilation: int = 4
+    K_latent: int = 64
+    M_mem: int = 64
+    titan_topk: int = 0
+    grad_ckpt: bool = True
 
-        # Build tensors over window (runtime state => no grad): [Bsz,H,w,r]
-        Kwin = state.K_latent.detach()
-        Vwin = state.V_latent.detach()
+    # recurrence
+    N_cycles: int = 2          # H-updates
+    T_steps: int = 2           # L-steps per H
+    reset_L_each_cycle: bool = True
 
-        if base_mask.any():
-            # logits: [Bsz,H,w]
-            logits = torch.einsum('bhr,bhwr->bhw', QL, Kwin) / (self.r ** 0.5)
-            attn_mask = base_mask.expand(-1, self.H, -1)  # [Bsz,H,w]
+    # heads
+    per_token_head: bool = False
 
-            # In incremental decode there are no future tokens within the current block yet, so
-            # standard causal enforcement reduces to masking invalid slots only. [PROVED]
+    # ACT (halting)
+    use_act: bool = True
+    Mmax: int = 4
+    epsilon: float = 0.1
 
-            probs = masked_softmax(logits, attn_mask, dim=-1)  # [Bsz,H,w]
-            YdotL = torch.einsum('bhw,bhwr->bhr', probs, Vwin)  # [Bsz,H,r]
+    # autocast + device
+    use_autocast: bool = True
+
+
+class HRM(nn.Module):
+    def __init__(self, cfg: HRMConfig):
+        super().__init__()
+        self.cfg = cfg
+
+        self.tok_emb = nn.Embedding(cfg.vocab_size, cfg.d_model)
+        self.pos_emb = nn.Embedding(cfg.max_len, cfg.d_model)
+
+        # merge projections
+        self.proj_x_to_L = nn.Linear(cfg.d_model, cfg.d_model, bias=False)
+        self.proj_H_to_L = nn.Linear(cfg.d_model, cfg.d_model, bias=False)
+        self.proj_L_to_H = nn.Linear(cfg.d_model, cfg.d_model, bias=False)
+
+        # stacks
+        self.L_net = FusedStack(
+            cfg.d_model, cfg.n_layers_L, cfg.n_heads, cfg.d_ff, cfg.dropout,
+            cfg.window, cfg.dilation, cfg.K_latent, cfg.M_mem, cfg.titan_topk, cfg.grad_ckpt
+        )
+        self.H_net = FusedStack(
+            cfg.d_model, cfg.n_layers_H, cfg.n_heads, cfg.d_ff, cfg.dropout,
+            cfg.window, cfg.dilation, cfg.K_latent, cfg.M_mem, cfg.titan_topk, cfg.grad_ckpt
+        )
+
+        # output head
+        self.norm_out = RMSNorm(cfg.d_model)
+        self.lm_head = nn.Linear(cfg.d_model, cfg.vocab_size, bias=False)
+
+        # ACT Q-head
+        self.q_head = nn.Linear(cfg.d_model, 2, bias=True) if cfg.use_act else None
+
+        self._init_params()
+
+    def _init_params(self):
+        for m in self.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.normal_(m.weight, mean=0.0, std=1.0 / math.sqrt(m.weight.size(-1)))
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+            if isinstance(m, nn.Embedding):
+                nn.init.normal_(m.weight, mean=0.0, std=1.0 / math.sqrt(m.embedding_dim))
+
+    # ----- helpers -----
+    def embed(self, input_ids: torch.Tensor) -> torch.Tensor:
+        B, L = input_ids.shape
+        pos = torch.arange(L, device=input_ids.device).unsqueeze(0).expand(B, L)
+        return self.tok_emb(input_ids) + self.pos_emb(pos)
+
+    def _L_update(self, zL: torch.Tensor, zH: torch.Tensor, x_emb: torch.Tensor,
+                  key_padding_mask: Optional[torch.Tensor]) -> Tuple[torch.Tensor, torch.Tensor]:
+        merged = zL + self.proj_H_to_L(zH) + self.proj_x_to_L(x_emb)
+        out, mem = self.L_net(merged, key_padding_mask, mem_carry=None)
+        return out, mem
+
+    def _H_update(self, zH: torch.Tensor, zL: torch.Tensor, key_padding_mask: Optional[torch.Tensor]) -> Tuple[torch.Tensor, torch.Tensor]:
+        merged = zH + self.proj_L_to_H(zL)
+        out, mem = self.H_net(merged, key_padding_mask, mem_carry=None)
+        return out, mem
+
+    def _reset_L(self, zL: torch.Tensor) -> torch.Tensor:
+        return torch.zeros_like(zL) if self.cfg.reset_L_each_cycle else zL
+
+    # ----- segment forward with one-step gradient -----
+    def forward_segment(
+        self,
+        state: Tuple[torch.Tensor, torch.Tensor],
+        input_ids: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
+    ) -> Tuple[Tuple[torch.Tensor, torch.Tensor], torch.Tensor, Optional[torch.Tensor]]:
+        """
+        Runs one "segment" of HRM.
+        Returns:
+          new_state (zH, zL), logits, q_values (halt/continue) or None
+        """
+        cfg = self.cfg
+        zH, zL = state
+        x_emb = self.embed(input_ids)
+
+        kpm = key_padding_from_attention_mask(attention_mask)
+
+        # All but last step under no_grad (1-step gradient approximation)
+        with torch.no_grad():
+            for i in range(cfg.N_cycles * cfg.T_steps - 1):
+                zL, _ = self._L_update(zL, zH, x_emb, kpm)
+                if (i + 1) % cfg.T_steps == 0:
+                    zH, _ = self._H_update(zH, zL, kpm)
+                    zL = self._reset_L(zL)
+
+        # Final step WITH grad
+        zL, _ = self._L_update(zL, zH, x_emb, kpm)
+        zH, _ = self._H_update(zH, zL, kpm)
+
+        if cfg.per_token_head:
+            logits = self.lm_head(self.norm_out(zH))  # (B, L, V)
         else:
-            YdotL = torch.zeros_like(QL)
+            pooled = self.norm_out(zH).mean(dim=1)    # (B, D)
+            logits = self.lm_head(pooled)             # (B, V)
 
-        # Honor skip decision per head: if skip, zero out local contribution. [PROVED]
-        YdotL = torch.where(use_local, YdotL, torch.zeros_like(YdotL))
+        q_values = None
+        if self.q_head is not None:
+            pooled = self.norm_out(zH).mean(dim=1)
+            q_values = self.q_head(pooled)  # (B, 2)
+        return (zH, zL), logits, q_values
 
-        # Decode to value dim: Y_dot = Y_dot^L D_v. [PROVED]
-        Ydot = torch.einsum('bhr,hrd->bhd', YdotL, self.D_v)
+    def init_state(self, B: int, L: int, device: Optional[torch.device] = None) -> Tuple[torch.Tensor, torch.Tensor]:
+        dev = device or next(self.parameters()).device
+        return torch.zeros(B, L, self.cfg.d_model, device=dev), torch.zeros(B, L, self.cfg.d_model, device=dev)
 
-        # ---------------- Infini latent memory read ----------------
-        sigmaQL = safe_softplus(QL)  # [Bsz,H,r]
-        # Read from detached snapshots to break links to previous steps. [PROVED]
-        M_read = state.M.detach().clone()
-        z_read = state.z.detach().clone()
-        num = torch.einsum('bhr,bhrr->bhr', sigmaQL, M_read)
-        den = (sigmaQL * z_read).sum(-1, keepdim=True).clamp_min(1e-6)
-        YmemL = num / den
-        Ymem = torch.einsum('bhr,hrd->bhd', YmemL, self.D_v)
 
-        # ---------------- Mix local vs memory ----------------
-        mix = torch.sigmoid(self.beta)  # [H,1]
-        mix = mix.unsqueeze(0).expand(Bsz, -1, -1)  # [Bsz,H,1]
-        A = mix * Ymem + (1.0 - mix) * Ydot  # [Bsz,H,d_v]  [PROVED]
+# -------------------- training helpers --------------------
 
-        # ---------------- Titans‑style memory update ----------------
-        # Delta‑corrected write. [INFERENCE]
-        sigmaKL = safe_softplus(KL)
-        # V_hat = (σ(K) M) / (σ(K)·z)
-        num_hat = torch.einsum('bhr,bhrr->bhr', sigmaKL, M_read)
-        den_hat = (sigmaKL * z_read).sum(-1, keepdim=True).clamp_min(1e-6)
-        VhatL = num_hat / den_hat
-        # w_t = σ(K)^T (V - V_hat)  => outer product [b,h,r,r]
-        delta = (VL - VhatL)
-        w_t = sigmaKL.unsqueeze(-1) * delta.unsqueeze(-2)
+def sequence_loss(logits: torch.Tensor, targets: torch.Tensor, per_token_head: bool) -> torch.Tensor:
+    if not per_token_head:
+        return F.cross_entropy(logits, targets)
+    B, L, V = logits.shape
+    return F.cross_entropy(logits.reshape(B * L, V), targets.reshape(B * L))
 
-        # Surprise features u_t: concat [QL, VL, VhatL, |delta|] along last dim. [INFERENCE]
-        u = torch.cat([QL, VL, VhatL, delta.abs()], dim=-1)  # [Bsz,H,4r]
-        alpha, eta, theta = self.gater(u)  # [Bsz,H,1] each
 
-        # Promote gate scalars to 4D for safe broadcasting with [B,H,r,r]
-        alpha4 = alpha.unsqueeze(-1)           # [B,H,1,1]
-        eta4   = eta.unsqueeze(-1)             # [B,H,1,1]
-        theta4 = theta.unsqueeze(-1)           # [B,H,1,1]
+@torch.no_grad()
+def _epsilon_min_segments(epsilon: float, Mmax: int) -> int:
+    if torch.rand(()) < epsilon and Mmax >= 2:
+        return int(torch.randint(2, Mmax + 1, (1,)).item())
+    return 1
 
-        S_prev_read = state.S_prev.detach().clone()
-        S_t = eta4 * S_prev_read + theta4 * w_t
-        with torch.no_grad():  # all runtime memory updates must NOT track grads
-            state.S_prev.copy_(S_t)
-            state.M.copy_((1.0 - alpha4) * state.M + S_t)
-            state.z.copy_((1.0 - alpha)  * state.z + sigmaKL)  # alpha broadcasts over r
 
-        # ---------------- Output projection ----------------
-        A_flat = A.reshape(Bsz, self.H * self.d_v)
-        out = self.W_o(A_flat)  # [Bsz, d_model]
+def deep_supervision_step(
+    model: HRM,
+    input_ids: torch.Tensor,
+    targets: torch.Tensor,
+    attention_mask: Optional[torch.Tensor],
+    state: Tuple[torch.Tensor, torch.Tensor],
+    optimizer: torch.optim.Optimizer,
+    use_act: bool,
+    Mmax: int,
+    epsilon: float,
+) -> Dict[str, Any]:
+    """
+    One training iteration across one or more supervision segments.
+    - Detaches state between segments, giving frequent H feedback (stabilizes).
+    - Optional ACT/Q-learning head approximated with BCE targets (simple & stable).
+    """
+    cfg = model.cfg
+    device = input_ids.device
+    Mmin = _epsilon_min_segments(epsilon, Mmax) if use_act else 1
+
+    m = 0
+    halted = False
+    total_seq = 0.0
+    total_q = 0.0
+    last_logits = None
+    last_q = None
+
+    while True:
+        m += 1
+        state, logits, q_values = model.forward_segment(state, input_ids, attention_mask)
+        seq_loss = sequence_loss(logits, targets, cfg.per_token_head)
+
+        if use_act and model.q_head is not None:
+            halt_logit, cont_logit = q_values[:, 0], q_values[:, 1]
+            want_halt = (m >= Mmin) & (halt_logit > cont_logit)
+            must_halt = (m >= Mmax)
+            do_halt = want_halt | must_halt
+
+            with torch.no_grad():
+                if not cfg.per_token_head:
+                    pred = logits.argmax(dim=-1)
+                    reward = (pred == targets).float()
+                else:
+                    pred = logits.argmax(dim=-1)
+                    reward = (pred.eq(targets).all(dim=1)).float()
+                target_halt = reward
+                target_continue = torch.zeros_like(reward)
+
+            q = torch.sigmoid(q_values)
+            q_loss = 0.5 * (
+                F.binary_cross_entropy(q[:, 0], target_halt) +
+                F.binary_cross_entropy(q[:, 1], target_continue)
+            )
+        else:
+            do_halt = (m >= Mmax)
+            q_loss = torch.tensor(0.0, device=device)
+
+        loss = seq_loss + q_loss
+        optimizer.zero_grad(set_to_none=True)
+        loss.backward()
+        optimizer.step()
+
+        total_seq += float(seq_loss.detach())
+        total_q   += float(q_loss.detach())
+        last_logits = logits.detach()
+        last_q = q_values.detach() if q_values is not None else None
+
+        # detach state between segments
+        state = (state[0].detach(), state[1].detach())
+
+        if do_halt:
+            halted = True
+            break
+
+    return {
+        "halted": halted,
+        "segments": m,
+        "seq_loss": total_seq / m,
+        "q_loss": total_q / max(1, m),
+        "last_logits": last_logits,
+        "last_q": last_q,
+        "state": state,
+    }
+
+
+# -------------------- full model wrapper --------------------
+
+class FusedV2HRMModel(nn.Module):
+    """
+    Convenience wrapper that exposes a HF-like API:
+      forward(input_ids, attention_mask=None, labels=None, return_loss=False, **kw)
+    """
+    def __init__(self, cfg: HRMConfig):
+        super().__init__()
+        self.cfg = cfg
+        self.core = HRM(cfg)
+
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
+        labels: Optional[torch.Tensor] = None,
+        return_loss: bool = False,
+    ) -> Dict[str, Any]:
+        B, L = input_ids.shape
+        state = self.core.init_state(B, L, device=input_ids.device)
+
+        # One segment forward (for eval/inference). Training should use deep_supervision_step().
+        state, logits, q_values = self.core.forward_segment(state, input_ids, attention_mask)
+
+        out = {"logits": logits, "q_values": q_values}
+        if return_loss and labels is not None:
+            out["loss"] = sequence_loss(logits, labels, self.cfg.per_token_head)
         return out
 
+    @torch.no_grad()
+    def generate(
+        self,
+        input_ids: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
+        max_new_tokens: int = 64,
+        temperature: float = 0.0,
+    ) -> torch.Tensor:
+        """
+        Greedy or temperature sampling over sequence-level head.
+        If per_token_head=True, this method does per-step token sampling.
+        """
+        cfg = self.cfg
+        B, L = input_ids.shape
+        device = input_ids.device
 
-# ---------------------------
-# Example wiring (manual test)
-# ---------------------------
-if __name__ == "__main__":
-    torch.manual_seed(0)
+        if not cfg.per_token_head:
+            # sequence-level: run segments and argmax a single label
+            state = self.core.init_state(B, L, device=device)
+            state, logits, _ = self.core.forward_segment(state, input_ids, attention_mask)
+            return logits.argmax(dim=-1)
 
-    d_model = 2048
-    H = 32
-    d_h = 128
-    d_v = 128
-    r = 64
-    w = 8192
-    B = 512
-    k = 2
-
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-
-    # Option 1: FP32 end‑to‑end (safe default). [PROVED]
-    attn = FusedAttentionV2(d_model, H, d_h, d_v, r, w, B, top_k_blocks=k, tau_skip=0.2).to(device)
-    st = attn.init_state(bsz=1, device=device)  # dtype follows module
-    x = torch.randn(1, d_model, device=device, dtype=attn.ln.weight.dtype)
-
-    for t in range(1024):
-        y = attn(x, st)
-        x = y  # dummy recurrence
-    print("OK — ran 1024 steps in FP32.")
-
-    # Option 2: FP16 end‑to‑end (if your GPU likes it). [PROVED]
-    if device.type == 'cuda':
-        attn16 = FusedAttentionV2(d_model, H, d_h, d_v, r, w, B, top_k_blocks=k, tau_skip=0.2).to(device).half()
-        st16 = attn16.init_state(bsz=1, device=device)  # state auto‑uses module dtype (fp16)
-        x16 = torch.randn(1, d_model, device=device, dtype=torch.float16)
-        for t in range(256):
-            y16 = attn16(x16, st16)
-            x16 = y16
-        print("OK — ran 256 steps in FP16.")
-
-    # Note: For production, consider PyTorch AMP for mixed precision. [UNVERIFIED]
+        # token-level generation (minimal example)
+        seq = input_ids.clone()
+        for _ in range(max_new_tokens):
+            Lcur = seq.size(1)
+            state = self.core.init_state(B, Lcur, device=device)
+            _, logits, _ = self.core.forward_segment(state, seq, attention_mask=None)
+            next_logits = logits[:, -1]
+            if temperature > 0:
+                probs = torch.softmax(next_logits / max(1e-5, temperature), dim=-1)
+                next_tok = torch.multinomial(probs, num_samples=1)
+            else:
+                next_tok = next_logits.argmax(dim=-1, keepdim=True)
+            seq = torch.cat([seq, next_tok], dim=1)
+        return seq
